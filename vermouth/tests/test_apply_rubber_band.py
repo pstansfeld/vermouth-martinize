@@ -541,3 +541,65 @@ def test_compute_force_constants(lower_bound, upper_bound, decay_factor, decay_p
 
     # Assert the result against the expected output
     assert result == pytest.approx(expected_output)
+
+
+def _dense_rubber_bands(molecule, selector, res_min_dist, domain_criterion, **params):
+    """The elastic network as the full distance and pair matrices give it (the earlier implementation)."""
+    selection = [idx for idx, attrs in enumerate(molecule.nodes.values()) if selector(attrs)]
+    idx_to_node = dict(enumerate(molecule.nodes))
+    node_to_idx = {node: idx for idx, node in idx_to_node.items()}
+    coordinates = np.stack([molecule.nodes[idx_to_node[idx]]['position'] for idx in selection])
+    distance_matrix = apply_rubber_band.self_distance_matrix(coordinates)
+    constants = apply_rubber_band.compute_force_constants(distance_matrix, **params)
+    connected = apply_rubber_band.build_connectivity_matrix(molecule, res_min_dist, node_to_idx, selection)
+    same_domain = apply_rubber_band.build_pair_matrix(molecule, domain_criterion, idx_to_node, selection)
+    constants *= (~connected) & same_domain
+    distance_matrix = distance_matrix.round(5)
+    bonds = []
+    for from_idx, to_idx in zip(*np.triu_indices_from(constants)):
+        if constants[from_idx, to_idx] > params['minimum_force']:
+            bonds.append(vermouth.molecule.Interaction(
+                atoms=(idx_to_node[selection[from_idx]], idx_to_node[selection[to_idx]]),
+                parameters=[6, distance_matrix[from_idx, to_idx], constants[from_idx, to_idx]],
+                meta={'group': 'Rubber band'}))
+    return bonds
+
+
+@pytest.mark.parametrize('seed', range(5))
+@pytest.mark.parametrize('criterion', ['always_true', 'same_chain'])
+@pytest.mark.parametrize('res_min_dist', [0, 2, 3])
+def test_rubber_bands_match_dense_matrices(seed, criterion, res_min_dist):
+    """
+    The neighbour search gives the same bonds, lengths, force constants and
+    order as the full matrices, for random multi-chain proteins.
+    """
+    rng = np.random.default_rng(seed)
+    molecule = vermouth.molecule.Molecule()
+    node = 0
+    for chain in 'ABC':
+        start = rng.uniform(0, 3, 3)
+        previous = None
+        for resid in range(1, 16):
+            # A random walk of residues with a backbone and a side chain bead
+            start = start + rng.normal(0, 0.25, 3)
+            for name, offset in (('BB', 0), ('SC1', 0.3)):
+                molecule.add_node(node, chain=chain, resid=resid, resname='ALA', atomname=name,
+                                  position=start + offset * rng.normal(size=3))
+                if name == 'SC1':
+                    molecule.add_edge(node - 1, node)
+                elif previous is not None:
+                    molecule.add_edge(previous, node)
+                node += 1
+            previous = node - 2
+    selector = functools.partial(selectors.proto_select_attribute_in, attribute='atomname', values=['BB'])
+    domain_criterion = getattr(apply_rubber_band, criterion)
+    params = dict(lower_bound=0.3, upper_bound=0.9, decay_factor=0.5, decay_power=1.0,
+                  base_constant=700, minimum_force=1)
+    expected = _dense_rubber_bands(molecule, selector, res_min_dist, domain_criterion, **params)
+    apply_rubber_band.apply_rubber_band(molecule, selector, bond_type=6, domain_criterion=domain_criterion,
+                                        res_min_dist=res_min_dist, **params)
+    found = molecule.interactions['bonds']
+    assert len(expected) > 0
+    assert [b.atoms for b in found] == [b.atoms for b in expected]
+    assert [b.parameters for b in found] == [b.parameters for b in expected]
+    assert all(b.meta == {'group': 'Rubber band'} for b in found)
