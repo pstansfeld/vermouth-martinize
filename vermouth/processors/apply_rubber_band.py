@@ -19,6 +19,7 @@ import itertools
 import numpy as np
 import networkx as nx
 import copy
+from scipy.spatial import cKDTree as KDTree
 
 from .processor import Processor
 from .. import selectors
@@ -79,6 +80,60 @@ def compute_decay(distance, shift, rate, power):
     shape as the input.
     """
     return np.exp(-rate * ((distance - shift) ** power))
+
+
+def _force_constants(distances, lower_bound, upper_bound, decay_factor,
+                     decay_power, base_constant, minimum_force, decay_shift=0):
+    """
+    The force constants of :func:`compute_force_constants`, element by element,
+    for distances between distinct points.
+    """
+    constants = compute_decay(distances, decay_shift, decay_factor, decay_power)
+    constants *= base_constant
+    constants[constants < minimum_force] = 0
+    constants[constants > base_constant] = base_constant
+    constants[distances > upper_bound] = 0
+    constants[distances < lower_bound] = 0
+    return constants
+
+
+def _candidate_pairs(coordinates, upper_bound):
+    """
+    Indices (i < j), in row-major order, of the pairs of points at most
+    'upper_bound' apart: the only pairs :func:`compute_force_constants` can
+    give a non-zero force constant. Also returns their distances, computed as
+    :func:`self_distance_matrix` does.
+    """
+    # Slightly beyond upper_bound, so that pairs at the bound are not lost to
+    # rounding; _force_constants applies the bound itself
+    radius = upper_bound * (1 + 1e-9) + 1e-12
+    pairs = KDTree(coordinates).query_pairs(radius, output_type='ndarray')
+    pairs = pairs.reshape(-1, 2)
+    pairs = pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+    distances = np.sqrt(np.sum(
+        (coordinates[pairs[:, 0]] - coordinates[pairs[:, 1]]) ** 2, axis=-1))
+    return pairs, distances
+
+
+def _residue_separation_within(molecule, separation, keys):
+    """
+    For node keys, a function telling whether two of them are in residues at
+    most 'separation' residues apart, as :func:`build_connectivity_matrix`
+    determines it (including two nodes in the same residue).
+    """
+    res_graph = make_residue_graph(molecule)
+    residue_of = {}
+    for res_idx in res_graph:
+        for node in res_graph.nodes[res_idx]['graph']:
+            residue_of[node] = res_idx
+    near = {}
+    for res_idx in {residue_of[key] for key in keys}:
+        near[res_idx] = set(nx.single_source_shortest_path_length(
+            res_graph, res_idx, cutoff=separation))
+
+    def within(left, right):
+        return residue_of[right] in near[residue_of[left]]
+    return within
 
 
 def compute_force_constants(distance_matrix, lower_bound, upper_bound,
@@ -336,36 +391,35 @@ def apply_rubber_band(molecule, selector,
                        type='unmapped-atom')
         return
 
-    distance_matrix = self_distance_matrix(coordinates)
-    constants = compute_force_constants(distance_matrix, lower_bound,
-                                        upper_bound, decay_factor, decay_power,
-                                        base_constant, minimum_force,
-                                        decay_shift=decay_shift)
-
-    connected = build_connectivity_matrix(molecule, res_min_dist, node_to_idx,
-                                          selected_nodes=selection)
-
-    same_domain = build_pair_matrix(molecule, domain_criterion, idx_to_node,
-                                    selected_nodes=selection)
-
-    can_be_linked = (~connected) & same_domain
-    # Multiply the force constant by 0 if the nodes cannot be linked.
-    constants *= can_be_linked
-    distance_matrix = distance_matrix.round(5)  # For compatibility with legacy
-    for from_idx, to_idx in zip(*np.triu_indices_from(constants)):
-        # note the indices in the matrix are not anymore the idx of
-        # the full molecule but the subset of nodes in selection
-        from_key = idx_to_node[selection[from_idx]]
-        to_key = idx_to_node[selection[to_idx]]
-        force_constant = constants[from_idx, to_idx]
-        length = distance_matrix[from_idx, to_idx]
-        if force_constant > minimum_force:
-            molecule.add_interaction(
-                type_='bonds',
-                atoms=(from_key, to_key),
-                parameters=[bond_type, length, force_constant],
-                meta={'group': 'Rubber band'},
-            )
+    # Only pairs within upper_bound can get a force constant, so they are found
+    # with a neighbour search rather than from the full distance matrix, which
+    # scales quadratically in time and memory. The bonds, lengths, constants and
+    # their order are those of the full matrices (see build_connectivity_matrix
+    # and build_pair_matrix).
+    pairs, distances = _candidate_pairs(coordinates, upper_bound)
+    constants = _force_constants(distances, lower_bound, upper_bound,
+                                 decay_factor, decay_power, base_constant,
+                                 minimum_force, decay_shift=decay_shift)
+    keep = constants > minimum_force
+    pairs, distances, constants = pairs[keep], distances[keep], constants[keep]
+    if not len(pairs):
+        return
+    keys = [idx_to_node[selection[idx]] for idx in range(len(selection))]
+    connected = _residue_separation_within(molecule, res_min_dist, keys)
+    distances = distances.round(5)  # For compatibility with legacy
+    for (from_idx, to_idx), length, force_constant in zip(pairs, distances, constants):
+        # note the indices are not anymore the idx of the full molecule but
+        # the subset of nodes in selection
+        from_key = keys[from_idx]
+        to_key = keys[to_idx]
+        if connected(from_key, to_key) or not domain_criterion(molecule, from_key, to_key):
+            continue
+        molecule.add_interaction(
+            type_='bonds',
+            atoms=(from_key, to_key),
+            parameters=[bond_type, length, force_constant],
+            meta={'group': 'Rubber band'},
+        )
 
 
 def always_true(*args, **kwargs):  # pylint: disable=unused-argument
